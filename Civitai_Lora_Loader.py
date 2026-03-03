@@ -7,10 +7,21 @@ import folder_paths
 from nodes import LoraLoader
 from comfy_api.latest import ComfyExtension, io as comfy_io
 import re
-import time
 from tqdm import tqdm
 
 class CivitaiLoraLoader(comfy_io.ComfyNode):
+    @staticmethod
+    def _safe_path_in_dir(base_dir: str, name: str):
+        base_abs = os.path.abspath(base_dir)
+        safe_name = CivitaiLoraLoader.safe_filename(name or "")
+        dest_abs = os.path.abspath(os.path.join(base_abs, safe_name))
+        try:
+            common = os.path.commonpath([base_abs, dest_abs])
+        except Exception:
+            return None, safe_name
+        if common != base_abs:
+            return None, safe_name
+        return dest_abs, safe_name
     @classmethod
     def define_schema(cls) -> comfy_io.Schema:
         return comfy_io.Schema(
@@ -203,20 +214,26 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                 if found_id and primary_name:
                     # Update name/ID with what we found
                     model_version_id = found_id
-                    # Check if primary_name exists on disk
-                    full_dest_path = os.path.join(loras_dir, primary_name)
-
-                    if os.path.exists(full_dest_path):
-                        filename = primary_name
-                        print(f"CivitaiLoraLoader: Found LoRA '{primary_name}'")
-                    elif auto_download:
-                        # Download to primary_name
-                        if cls.download_lora(model_version_id, primary_name, loras_dir, valid_api_key):
-                            filename = primary_name
-                        else:
-                            print(f"CivitaiLoraLoader: Download failed for '{primary_name}'")
+                    # Check if primary_name exists on disk (sanitize and confine to loras_dir)
+                    full_dest_path, safe_primary = cls._safe_path_in_dir(loras_dir, primary_name)
+                    if not full_dest_path:
+                        print("CivitaiLoraLoader: Unsafe destination path detected; aborting.")
+                        primary_name = None
                     else:
-                        print(f"CivitaiLoraLoader: Auto-download disabled. Missing '{primary_name}'.")
+                        primary_name = safe_primary
+
+                    if primary_name:
+                        if os.path.exists(full_dest_path):
+                            filename = primary_name
+                            print(f"CivitaiLoraLoader: Found LoRA '{primary_name}'")
+                        elif auto_download:
+                            # Download to sanitized primary_name
+                            if cls.download_lora(model_version_id, primary_name, loras_dir, valid_api_key):
+                                filename = primary_name
+                            else:
+                                print(f"CivitaiLoraLoader: Download failed for '{primary_name}'")
+                        else:
+                            print(f"CivitaiLoraLoader: Auto-download disabled. Missing '{primary_name}'.")
                 else:
                     print(f"CivitaiLoraLoader: Could not resolve info for '{name}'")
 
@@ -252,8 +269,11 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                     print(f"CivitaiLoraLoader: Download failed with status {response.status}")
                     return False
 
-                # Use provided filename
-                output_path = os.path.join(loras_dir, filename)
+                # Use provided filename (sanitize and confine to loras_dir)
+                output_path, safe_name = CivitaiLoraLoader._safe_path_in_dir(loras_dir, filename)
+                if not output_path:
+                    print("CivitaiLoraLoader: Unsafe destination path detected; aborting download.")
+                    return False
 
                 if os.path.exists(output_path):
                     return True
@@ -262,7 +282,7 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
 
                 chunk_size = 8192
                 with open(output_path, "wb") as f:
-                    with tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"Downloading {filename}", leave=True) as pbar:
+                    with tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"Downloading {safe_name}", leave=True) as pbar:
                         while True:
                             chunk = response.read(chunk_size)
                             if not chunk:
