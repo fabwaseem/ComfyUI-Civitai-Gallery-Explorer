@@ -1,7 +1,7 @@
 [project]
 name = "civitai-gallery-explorer"
 description = "Browse Civitai gallery directly in ComfyUI with infinite scroll, advanced filters, favorites, and seamless prompt/model integration."
-version = "1.0"
+version = "1.0.1"
 license = {file = "LICENSE"}
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)
