@@ -7,6 +7,7 @@ import folder_paths
 from nodes import LoraLoader
 from comfy_api.latest import ComfyExtension, io as comfy_io
 import re
+import time
 from tqdm import tqdm
 
 class CivitaiLoraLoader(comfy_io.ComfyNode):
@@ -22,6 +23,40 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
         if common != base_abs:
             return None, safe_name
         return dest_abs, safe_name
+    @staticmethod
+    def _parse_remote_total(response):
+        content_range = response.headers.get("Content-Range")
+        if content_range:
+            match = re.search(r"/(\d+)$", content_range.strip())
+            if match:
+                try:
+                    return int(match.group(1))
+                except Exception:
+                    return None
+
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            try:
+                return int(content_length)
+            except Exception:
+                return None
+
+        return None
+    @staticmethod
+    def _probe_remote_size(url, headers, ctx):
+        probe_headers = dict(headers)
+        probe_headers["Range"] = "bytes=0-0"
+        req = urllib.request.Request(url, headers=probe_headers)
+
+        try:
+            with urllib.request.urlopen(req, context=ctx) as response:
+                total = CivitaiLoraLoader._parse_remote_total(response)
+                if total and total > 0:
+                    return total
+        except Exception:
+            return None
+
+        return None
     @classmethod
     def define_schema(cls) -> comfy_io.Schema:
         return comfy_io.Schema(
@@ -260,50 +295,88 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
         ctx.verify_mode = ssl.CERT_NONE
 
         headers = {'User-Agent': 'Mozilla/5.0'}
+        output_path, safe_name = CivitaiLoraLoader._safe_path_in_dir(loras_dir, filename)
+        if not output_path:
+            print("CivitaiLoraLoader: Unsafe destination path detected; aborting download.")
+            return False
 
-        req = urllib.request.Request(url, headers=headers)
+        part_path = f"{output_path}.part"
+        remote_size = CivitaiLoraLoader._probe_remote_size(url, headers, ctx)
 
-        try:
-            with urllib.request.urlopen(req, context=ctx) as response:
-                if response.status != 200:
-                    print(f"CivitaiLoraLoader: Download failed with status {response.status}")
-                    return False
-
-                # Use provided filename (sanitize and confine to loras_dir)
-                output_path, safe_name = CivitaiLoraLoader._safe_path_in_dir(loras_dir, filename)
-                if not output_path:
-                    print("CivitaiLoraLoader: Unsafe destination path detected; aborting download.")
-                    return False
-
-                if os.path.exists(output_path):
-                    return True
-
-                total_size = int(response.headers.get('Content-Length', 0))
-
-                chunk_size = 8192
-                with open(output_path, "wb") as f:
-                    with tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"Downloading {safe_name}", leave=True) as pbar:
-                        while True:
-                            chunk = response.read(chunk_size)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            pbar.update(len(chunk))
-
-                print(f"CivitaiLoraLoader: Download complete: {filename}")
+        if os.path.exists(output_path):
+            final_size = os.path.getsize(output_path)
+            if remote_size and final_size == remote_size:
                 return True
+            if not remote_size and final_size > 0:
+                return True
+            os.replace(output_path, part_path)
 
-        except urllib.error.HTTPError as e:
-             if e.code == 404:
-                 print(f"CivitaiLoraLoader: LoRA not found (404).")
-             elif e.code == 401:
-                 print(f"CivitaiLoraLoader: Unauthorized (401). Check your API Key.")
-             else:
-                 print(f"CivitaiLoraLoader: HTTP Error {e.code}: {e.reason}")
-             return False
-        except Exception as e:
-             print(f"CivitaiLoraLoader: Error downloading: {e}")
-             return False
+        max_retries = 5
+        chunk_size = 1024 * 1024
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resume_from = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+                req_headers = dict(headers)
+                if resume_from > 0:
+                    req_headers["Range"] = f"bytes={resume_from}-"
+
+                req = urllib.request.Request(url, headers=req_headers)
+                with urllib.request.urlopen(req, context=ctx) as response:
+                    if response.status not in (200, 206):
+                        raise RuntimeError(f"Download failed with status {response.status}")
+
+                    if resume_from > 0 and response.status == 200 and os.path.exists(part_path):
+                        os.remove(part_path)
+                        resume_from = 0
+
+                    content_length = response.headers.get("Content-Length")
+                    expected_total = CivitaiLoraLoader._parse_remote_total(response)
+                    if response.status == 206 and content_length and expected_total is None:
+                        try:
+                            expected_total = resume_from + int(content_length)
+                        except Exception:
+                            expected_total = None
+
+                    mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
+                    initial = resume_from if mode == "ab" else 0
+                    with open(part_path, mode) as f:
+                        with tqdm(total=expected_total, initial=initial, unit='iB', unit_scale=True, desc=f"Downloading {safe_name}", leave=True) as pbar:
+                            while True:
+                                chunk = response.read(chunk_size)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+
+                current_size = os.path.getsize(part_path)
+                verified_total = remote_size or expected_total
+                if verified_total and current_size < verified_total:
+                    raise RuntimeError(f"Incomplete download: {current_size}/{verified_total} bytes")
+
+                os.replace(part_path, output_path)
+                final_size = os.path.getsize(output_path)
+                if verified_total and final_size < verified_total:
+                    raise RuntimeError(f"Incomplete final file: {final_size}/{verified_total} bytes")
+
+                print(f"CivitaiLoraLoader: Download complete: {safe_name}")
+                return True
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    print("CivitaiLoraLoader: LoRA not found (404).")
+                    return False
+                if e.code == 401:
+                    print("CivitaiLoraLoader: Unauthorized (401). Check your API Key.")
+                    return False
+                print(f"CivitaiLoraLoader: HTTP Error {e.code}: {e.reason}")
+            except Exception as e:
+                print(f"CivitaiLoraLoader: Download attempt {attempt}/{max_retries} failed: {e}")
+
+            if attempt < max_retries:
+                time.sleep(min(2 ** (attempt - 1), 8))
+
+        print(f"CivitaiLoraLoader: Failed to download {safe_name} after {max_retries} attempts.")
+        return False
 
 class CivitaiLoraLoaderExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[comfy_io.ComfyNode]]:
