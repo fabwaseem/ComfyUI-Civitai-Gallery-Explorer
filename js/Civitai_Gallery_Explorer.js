@@ -205,11 +205,42 @@ const qs = (o) =>
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join("&");
 
-const getJSON = async (path) => {
-  const r = await api.fetchApi(path);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return await r.json();
+function safeHttpUrl(url) {
+  if (!url || typeof url !== "string") return "";
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}
+
+const fetchJSON = async (path, options = {}, timeoutMs = 45000) => {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await api.fetchApi(path, { ...options, signal: ctrl.signal });
+    if (!r.ok) {
+      let detail = "";
+      try {
+        const body = await r.json();
+        detail = body?.error || body?.message || "";
+      } catch {
+        detail = "";
+      }
+      throw new Error(detail ? `${r.status} ${detail}` : `${r.status} ${r.statusText}`);
+    }
+    return await r.json();
+  } catch (err) {
+    if (err && err.name === "AbortError") throw new Error("Request timed out");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 };
+
+const getJSON = (path) => fetchJSON(path);
 
 const keyId = (id) => String(id);
 
@@ -631,6 +662,30 @@ function ensureHiddenSelectionWidget(node) {
   </div>
         `;
 
+        const MIN_W = 900;
+        const MIN_H = 650;
+        const _onResize = node.onResize;
+        const layoutGallery = function (size) {
+          _onResize?.apply(this, arguments);
+          if (size[0] < MIN_W) size[0] = MIN_W;
+          if (size[1] < MIN_H) size[1] = MIN_H;
+
+          const inputs = ["positive_prompt", "negative_prompt", "lora_data"];
+          inputs.forEach((name) => {
+            const w = node.widgets?.find((widget) => widget.name === name);
+            if (w) {
+              w.computeSize = () => [size[0] - 20, 150];
+            }
+          });
+
+          const reserved = 590;
+          const h = Math.max(200, size[1] - reserved);
+          root.style.height = h + "px";
+          root.style.maxHeight = h + "px";
+          domWidget.computeSize = () => [size[0], h];
+          return size;
+        };
+
         const domWidget = node.addDOMWidget("civitai_gallery", "div", root, {});
 
         // Move gallery to top so inputs are below it
@@ -642,38 +697,8 @@ function ensureHiddenSelectionWidget(node) {
 
         // Increase node height to fit gallery + inputs
         node.size = [1120, 1800];
-
-        // Ensure gallery doesn't overlap inputs by dynamically sizing it
-        const _onResize = node.onResize;
-        node.onResize = function (size) {
-          _onResize?.apply(this, arguments);
-
-          // Fix input widgets height so they don't expand
-          const inputs = ["positive_prompt", "negative_prompt", "lora_data"];
-          inputs.forEach((name) => {
-            const w = node.widgets?.find((w) => w.name === name);
-            if (w) {
-              // Force fixed height
-              w.computeSize = () => [size[0] - 20, 150];
-            }
-          });
-
-          // Reserve space for inputs at bottom (3 inputs * 150 + margins approx 140px)
-          const reserved = 590;
-          const h = Math.max(200, size[1] - reserved);
-
-          root.style.height = h + "px";
-          root.style.maxHeight = h + "px";
-
-          // Tell ComfyUI the gallery widget takes up this space
-          // This pushes the inputs down below the gallery
-          domWidget.computeSize = () => [size[0], h];
-        };
-        // Trigger once to set initial size
+        node.onResize = layoutGallery;
         node.onResize(node.size);
-
-        const MIN_W = 900;
-        const MIN_H = 650;
 
         const $ = (s) => root.querySelector(s);
 
@@ -703,7 +728,6 @@ function ensureHiddenSelectionWidget(node) {
         const elBtnUnique = $(".cg-toggle-unique");
         const elBtnFavOnly = $(".cg-toggle-favonly");
         const elLimitSel = $(".cg-limit");
-        const elBtnRender = $(".cg-toggle-render");
 
         let loading = false;
         let hasMore = true;
@@ -1251,9 +1275,13 @@ function ensureHiddenSelectionWidget(node) {
             v.playsInline = true;
             v.preload = "none";
             const poster = posterFromItem(it);
-            if (poster) v.poster = poster;
-            v.dataset.src =
-              it.url || it?.meta?.videoUrl || it?.meta?.mp4Url || "";
+            if (poster) {
+              const safePoster = safeHttpUrl(poster);
+              if (safePoster) v.poster = safePoster;
+            }
+            v.dataset.src = safeHttpUrl(
+              it.url || it?.meta?.videoUrl || it?.meta?.mp4Url || "",
+            );
 
             const freeze = () => {
               try {
@@ -1272,7 +1300,7 @@ function ensureHiddenSelectionWidget(node) {
             img.className = "cg-img";
             img.loading = "lazy";
             img.alt = `#${keyId(it.id)}`;
-            img.src = getOptimizedImageUrl(it);
+            img.src = safeHttpUrl(getOptimizedImageUrl(it));
             d.appendChild(img);
           }
 
@@ -1291,7 +1319,7 @@ function ensureHiddenSelectionWidget(node) {
 
           const open = document.createElement("a");
           open.className = "cg-open";
-          open.href = civitaiPageUrl(it);
+          open.href = safeHttpUrl(civitaiPageUrl(it)) || "https://civitai.com";
           open.target = "_blank";
           open.rel = "noopener noreferrer";
           open.textContent = "Open ↗";
@@ -1315,15 +1343,11 @@ function ensureHiddenSelectionWidget(node) {
           star.addEventListener("click", async (e) => {
             e.stopPropagation();
             try {
-              const resp = await api.fetchApi(
-                "/civitai_gallery/toggle_favorite",
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ item: it }),
-                },
-              );
-              const data = await resp.json();
+              const data = await fetchJSON("/civitai_gallery/toggle_favorite", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ item: it }),
+              });
               const k = keyId(it.id);
 
               if (data.status === "added") {
@@ -1745,10 +1769,9 @@ function ensureHiddenSelectionWidget(node) {
         };
 
         node.onResize = function (size) {
-          if (size[0] < MIN_W) size[0] = MIN_W;
-          if (size[1] < MIN_H) size[1] = MIN_H;
+          const out = layoutGallery.call(this, size);
           requestAnimationFrame(checkAndAutofill);
-          return size;
+          return out;
         };
 
         [elNSFW, elSort, elPeriod, elLimitSel].forEach((x) =>
@@ -1771,17 +1794,14 @@ function ensureHiddenSelectionWidget(node) {
         elBaseModelsPanel.addEventListener("pointerdown", (e) => {
           e.stopPropagation();
         });
-        document.addEventListener(
-          "pointerdown",
-          (e) => {
-            const path = e.composedPath ? e.composedPath() : [];
-            const inside = path.length
-              ? path.includes(elBaseModels)
-              : elBaseModels.contains(e.target);
-            if (!inside) setBaseModelsOpen(false);
-          },
-          true,
-        );
+        const onDocPointerDown = (e) => {
+          const path = e.composedPath ? e.composedPath() : [];
+          const inside = path.length
+            ? path.includes(elBaseModels)
+            : elBaseModels.contains(e.target);
+          if (!inside) setBaseModelsOpen(false);
+        };
+        document.addEventListener("pointerdown", onDocPointerDown, true);
         elBaseModelsSearch.addEventListener("keydown", (e) => {
           if (e.key === "Escape") setBaseModelsOpen(false);
         });
@@ -1874,6 +1894,9 @@ function ensureHiddenSelectionWidget(node) {
           } catch {}
           try {
             unbindScroll();
+          } catch {}
+          try {
+            document.removeEventListener("pointerdown", onDocPointerDown, true);
           } catch {}
           return _prevOnRemoved?.apply(this, arguments);
         };

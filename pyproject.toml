@@ -1,31 +1,24 @@
 [project]
 name = "civitai-gallery-explorer"
 description = "Browse Civitai gallery directly in ComfyUI with infinite scroll, advanced filters, favorites, and seamless prompt/model integration."
-version = "1.0.2"
-license = {file = "LICENSE"}
-# classifiers = [
-#     # For OS-independent nodes (works on all operating systems)
-#     "Operating System :: OS Independent",
-#
-#     # OR for OS-specific nodes, specify the supported systems:
-#     "Operating System :: Microsoft :: Windows",  # Windows specific
-#     "Operating System :: POSIX :: Linux",  # Linux specific
-#     "Operating System :: MacOS",  # macOS specific
-#
-#     # GPU Accelerator support. Pick the ones that are supported by your extension.
-#     "Environment :: GPU :: NVIDIA CUDA",    # NVIDIA CUDA support
-#     "Environment :: GPU :: AMD ROCm",       # AMD ROCm support
-#     "Environment :: GPU :: Intel Arc",      # Intel Arc support
-#     "Environment :: NPU :: Huawei Ascend",  # Huawei Ascend support
-#     "Environment :: GPU :: Apple Metal",    # Apple Metal support
-# ]
-
-dependencies = ["numpy>=1.21.0", "Pillow>=9.0.0", "aiohttp>=3.8.0"]
+version = "1.0.3"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.21.0",
+  "Pillow>=9.0.0",
+  "aiohttp>=3.8.0",
+  "tqdm>=4.65.0",
+  "typing_extensions>=4.5.0",
+]
+classifiers = [
+  "Operating System :: OS Independent",
+]
 
 [project.urls]
 Repository = "https://github.com/fabwaseem/ComfyUI-Civitai-Gallery-Explorer"
-#  Used by Comfy Registry https://registry.comfy.org
-Documentation = "https://github.com/fabwaseem/ComfyUI-Civitai-Gallery-Explorer/wiki"
+Documentation = "https://github.com/fabwaseem/ComfyUI-Civitai-Gallery-Explorer/blob/main/README.md"
 "Bug Tracker" = "https://github.com/fabwaseem/ComfyUI-Civitai-Gallery-Explorer/issues"
 
 [tool.comfy]
@@ -33,5 +26,37 @@ PublisherId = "fabwaseem"
 DisplayName = "CivitAI Gallery Explorer"
 Icon = ""
 includes = []
-# "requires-comfyui" = ">=1.0.0"  # ComfyUI version compatibility
+requires-comfyui = ">=0.3.60"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "ASYNC"]
+ignore = [
+  "E501",
+  "S110",
+  "SIM108",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["_safety"]
+known-third-party = [
+  "aiohttp",
+  "comfy_api",
+  "folder_paths",
+  "nodes",
+  "numpy",
+  "PIL",
+  "server",
+  "torch",
+  "tqdm",
+  "typing_extensions",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]

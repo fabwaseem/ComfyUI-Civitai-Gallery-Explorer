@@ -1,18 +1,19 @@
-# ----- SECTION: Imports -----
+from __future__ import annotations
+
 import asyncio
 import importlib.util
-import inspect
 import os
 import sys
-from typing import Any, Awaitable, Callable, List, Optional
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 # ----- SECTION: Public Globals -----
 WEB_DIRECTORY = "./js"
 
 # ----- SECTION: Module Discovery -----
-def _discover_py_files() -> List[str]:
+def _discover_py_files() -> list[str]:
     pkg_dir = os.path.dirname(__file__)
-    files: List[str] = []
+    files: list[str] = []
     for fname in os.listdir(pkg_dir):
         if not fname.endswith(".py"):
             continue
@@ -33,8 +34,8 @@ def _safe_mod_name(i: int, path: str) -> str:
     return f"_v3_{pkg}_{base}_{i}"
 
 
-def _load_modules(py_files: List[str]) -> List[Any]:
-    modules: List[Any] = []
+def _load_modules(py_files: list[str]) -> list[Any]:
+    modules: list[Any] = []
     for i, fpath in enumerate(py_files):
         try:
             mod_name = _safe_mod_name(i, fpath)
@@ -51,7 +52,7 @@ def _load_modules(py_files: List[str]) -> List[Any]:
 
 
 _MODULES = _load_modules(_discover_py_files())
-_ENTRYPOINTS: List[Callable[[], Any]] = []
+_ENTRYPOINTS: list[Callable[[], Any]] = []
 for _m in _MODULES:
     _ep = getattr(_m, "comfy_entrypoint", None)
     if callable(_ep):
@@ -65,11 +66,12 @@ async def _await_if_needed(v: Any) -> Any:
 
 # ----- SECTION: V3 Entry Point (comfy_entrypoint) -----
 async def comfy_entrypoint():
-    from comfy_api.latest import ComfyExtension, io as comfy_io
+    from comfy_api.latest import ComfyExtension
+    from comfy_api.latest import io as comfy_io
 
     class _AggregateExtension(ComfyExtension):
         async def get_node_list(self) -> list[type[comfy_io.ComfyNode]]:
-            nodes: List[type[comfy_io.ComfyNode]] = []
+            nodes: list[type[comfy_io.ComfyNode]] = []
             for ep in _ENTRYPOINTS:
                 ext = await _await_if_needed(ep())
                 if ext is None:

@@ -1,28 +1,40 @@
-import os
+from __future__ import annotations
+
+import contextlib
 import json
-import urllib.request
-import urllib.error
-import ssl
-import folder_paths
-from nodes import LoraLoader
-from comfy_api.latest import ComfyExtension, io as comfy_io
+import os
 import re
 import time
+import urllib.error
+import urllib.request
+
+import folder_paths
+from comfy_api.latest import ComfyExtension
+from comfy_api.latest import io as comfy_io
+from nodes import LoraLoader
 from tqdm import tqdm
+
+from _safety import (
+    API_TIMEOUT_S,
+    DOWNLOAD_TIMEOUT_S,
+    MAX_LORA_BYTES,
+    clean_model_hash,
+    digits_only,
+    redact_secrets,
+    safe_join,
+    safe_urlopen,
+)
+from _safety import (
+    safe_filename as _safe_filename,
+)
+
 
 class CivitaiLoraLoader(comfy_io.ComfyNode):
     @staticmethod
     def _safe_path_in_dir(base_dir: str, name: str):
-        base_abs = os.path.abspath(base_dir)
         safe_name = CivitaiLoraLoader.safe_filename(name or "")
-        dest_abs = os.path.abspath(os.path.join(base_abs, safe_name))
-        try:
-            common = os.path.commonpath([base_abs, dest_abs])
-        except Exception:
-            return None, safe_name
-        if common != base_abs:
-            return None, safe_name
-        return dest_abs, safe_name
+        return safe_join(base_dir, safe_name), safe_name
+
     @staticmethod
     def _parse_remote_total(response):
         content_range = response.headers.get("Content-Range")
@@ -31,32 +43,34 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
             if match:
                 try:
                     return int(match.group(1))
-                except Exception:
+                except ValueError:
                     return None
 
         content_length = response.headers.get("Content-Length")
         if content_length:
             try:
                 return int(content_length)
-            except Exception:
+            except ValueError:
                 return None
 
         return None
+
     @staticmethod
-    def _probe_remote_size(url, headers, ctx):
+    def _probe_remote_size(url, headers):
         probe_headers = dict(headers)
         probe_headers["Range"] = "bytes=0-0"
-        req = urllib.request.Request(url, headers=probe_headers)
+        req = urllib.request.Request(url, headers=probe_headers)  # noqa: S310
 
         try:
-            with urllib.request.urlopen(req, context=ctx) as response:
+            with safe_urlopen(req, timeout=API_TIMEOUT_S) as response:
                 total = CivitaiLoraLoader._parse_remote_total(response)
                 if total and total > 0:
                     return total
-        except Exception:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             return None
 
         return None
+
     @classmethod
     def define_schema(cls) -> comfy_io.Schema:
         return comfy_io.Schema(
@@ -70,23 +84,23 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                     "lora_data",
                     default="[]",
                     multiline=True,
-                    tooltip="JSON string containing LoRA data"
+                    tooltip="JSON string containing LoRA data",
                 ),
                 comfy_io.String.Input(
                     "civitai_api_key",
                     default="",
                     multiline=False,
-                    tooltip="Optional: Civitai API Key for authenticated downloads"
+                    tooltip="Optional: Civitai API Key for authenticated downloads",
                 ),
                 comfy_io.Boolean.Input(
                     "auto_download",
                     default=True,
-                    tooltip="Automatically download missing LoRAs from Civitai"
+                    tooltip="Automatically download missing LoRAs from Civitai",
                 ),
                 comfy_io.Boolean.Input(
                     "force_fetch",
                     default=False,
-                    tooltip="Force check/download even if file exists"
+                    tooltip="Force check/download even if file exists",
                 ),
             ],
             outputs=[
@@ -97,11 +111,7 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
 
     @staticmethod
     def safe_filename(name):
-        # Equivalent to safeFilename in lora.ts
-        base = re.sub(r'[<>:"/\\|?*]', '_', name).strip()
-        if base.lower().endswith('.safetensors') or base.lower().endswith('.pt'):
-            return base
-        return f"{base}.safetensors"
+        return _safe_filename(name)
 
     @staticmethod
     def find_in_folder(loras_dir, resource_name):
@@ -112,8 +122,9 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
             entries = os.listdir(loras_dir)
             lower_resource = resource_name.lower()
 
-            # 1. Partial match logic from lora.ts
             for entry in entries:
+                if os.path.basename(entry) != entry:
+                    continue
                 full_path = os.path.join(loras_dir, entry)
                 if not os.path.isfile(full_path):
                     continue
@@ -124,74 +135,75 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                 if lower_resource in entry_lower or entry_no_ext in lower_resource:
                     return entry
 
-            # 2. Exact safe filename match
             exact = CivitaiLoraLoader.safe_filename(resource_name)
             if exact in entries:
                 return exact
 
             return None
-        except Exception:
+        except OSError:
             return None
 
     @classmethod
+    def _read_version(cls, url, headers):
+        req = urllib.request.Request(url, headers=headers)  # noqa: S310
+        with safe_urlopen(req, timeout=API_TIMEOUT_S) as response:
+            if response.status != 200:
+                return None
+            data = json.load(response)
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _primary_name_from_payload(cls, data):
+        files = data.get("files", []) if isinstance(data, dict) else []
+        if not isinstance(files, list) or not files:
+            return None
+        primary = next((f for f in files if isinstance(f, dict) and f.get("primary")), None)
+        if primary is None:
+            primary = files[0] if isinstance(files[0], dict) else None
+        if not primary:
+            return None
+        name = primary.get("name")
+        return str(name) if name else None
+
+    @classmethod
     def get_version_info(cls, version_id, file_hash, api_key=None):
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {"User-Agent": "Mozilla/5.0"}
         if api_key and api_key.strip():
-            headers['Authorization'] = f'Bearer {api_key.strip()}'
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
 
+        version_id = digits_only(version_id)
+        file_hash = clean_model_hash(file_hash)
         found_version_id = None
         primary_name = None
 
-        # 1. Try by modelVersionId
         if version_id:
             url = f"https://civitai.com/api/v1/model-versions/{version_id}"
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, context=ctx) as response:
-                    if response.status == 200:
-                        data = json.load(response)
-                        found_version_id = data.get('id', version_id)
-                        files = data.get('files', [])
-                        primary = next((f for f in files if f.get('primary')), files[0] if files else None)
-                        if primary:
-                            primary_name = primary.get('name')
-            except Exception:
+                data = cls._read_version(url, headers)
+                if data:
+                    found_version_id = digits_only(data.get("id", version_id)) or version_id
+                    primary_name = cls._primary_name_from_payload(data)
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, KeyError):
                 pass
 
-        # 2. Try by hash if needed
         if (not found_version_id or not primary_name) and file_hash:
             url = f"https://civitai.com/api/v1/model-versions/by-hash/{file_hash}"
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, context=ctx) as response:
-                    if response.status == 200:
-                        data = json.load(response)
-                        found_version_id = data.get('id', found_version_id)
-                        files = data.get('files', [])
-                        primary = next((f for f in files if f.get('primary')), files[0] if files else None)
-                        if primary:
-                            primary_name = primary.get('name')
-            except Exception:
+                data = cls._read_version(url, headers)
+                if data:
+                    found_version_id = digits_only(data.get("id", found_version_id)) or found_version_id
+                    primary_name = cls._primary_name_from_payload(data) or primary_name
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, KeyError):
                 pass
 
-        # 3. If primary_name not found but we have found_version_id, try to get model info to find default file
         if found_version_id and not primary_name:
-             url = f"https://civitai.com/api/v1/model-versions/{found_version_id}"
-             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, context=ctx) as response:
-                    if response.status == 200:
-                        data = json.load(response)
-                        files = data.get('files', [])
-                        # Fallback to first file if no primary
-                        if files and len(files) > 0:
-                            primary_name = files[0].get('name')
-             except Exception:
-                 pass
+            url = f"https://civitai.com/api/v1/model-versions/{found_version_id}"
+            try:
+                data = cls._read_version(url, headers)
+                if data:
+                    primary_name = cls._primary_name_from_payload(data)
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, KeyError):
+                pass
 
         if found_version_id and primary_name:
             return found_version_id, primary_name
@@ -199,16 +211,50 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
         return None, None
 
     @classmethod
+    def _resolve_and_maybe_download(
+        cls, name, model_version_id, file_hash, api_key, auto_download, force_fetch, loras_dir
+    ):
+        found_id, primary_name = cls.get_version_info(model_version_id, file_hash, api_key)
+        if not (found_id and primary_name):
+            print(f"CivitaiLoraLoader: Could not resolve info for '{name}'")
+            return None
+
+        full_dest_path, safe_primary = cls._safe_path_in_dir(loras_dir, primary_name)
+        if not full_dest_path:
+            print("CivitaiLoraLoader: Unsafe destination path detected; aborting.")
+            return None
+
+        exists = os.path.exists(full_dest_path)
+        if exists and not (force_fetch and auto_download):
+            print(f"CivitaiLoraLoader: Found LoRA '{safe_primary}'")
+            return safe_primary
+
+        if not exists and not auto_download:
+            print(f"CivitaiLoraLoader: Auto-download disabled. Missing '{safe_primary}'.")
+            return None
+
+        if cls.download_lora(found_id, safe_primary, loras_dir, api_key):
+            return safe_primary
+
+        print(f"CivitaiLoraLoader: Download failed for '{safe_primary}'")
+        if os.path.exists(full_dest_path):
+            return safe_primary
+        return None
+
+    @classmethod
     def execute(cls, model, clip, lora_data, civitai_api_key, auto_download, force_fetch):
-        # Sanitize API Key
         valid_api_key = None
         if civitai_api_key and isinstance(civitai_api_key, str) and len(civitai_api_key.strip()) > 5:
             valid_api_key = civitai_api_key.strip()
 
+        if not isinstance(lora_data, str) or len(lora_data) > 2_000_000:
+            print("CivitaiLoraLoader: Invalid JSON in lora_data")
+            return (model, clip)
+
         try:
             lora_list = json.loads(lora_data)
-        except Exception:
-            print(f"CivitaiLoraLoader: Invalid JSON in lora_data")
+        except (json.JSONDecodeError, TypeError, ValueError):
+            print("CivitaiLoraLoader: Invalid JSON in lora_data")
             return (model, clip)
 
         if not isinstance(lora_list, list):
@@ -228,51 +274,32 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
             name = lora.get("name", "unknown")
             try:
                 weight = float(lora.get("strength", lora.get("weight", 1.0)))
-            except:
+            except (TypeError, ValueError):
                 weight = 1.0
 
             model_version_id = lora.get("modelVersionId")
             file_hash = lora.get("hash")
 
-            # Step 1: Try to find in folder by name (if name is known)
-            filename = None
+            local_filename = None
             if name and name != "unknown":
-                filename = cls.find_in_folder(loras_dir, name)
-                if filename:
-                    # Found locally, nothing to log unless verbose
-                    pass
+                local_filename = cls.find_in_folder(loras_dir, name)
 
-            # Step 2: If not found, fetch version info to get real name
-            if not filename:
-                found_id, primary_name = cls.get_version_info(model_version_id, file_hash, valid_api_key)
+            filename = None
+            if local_filename and not force_fetch:
+                filename = local_filename
+            else:
+                filename = cls._resolve_and_maybe_download(
+                    name,
+                    model_version_id,
+                    file_hash,
+                    valid_api_key,
+                    auto_download,
+                    force_fetch,
+                    loras_dir,
+                )
+                if not filename and local_filename:
+                    filename = local_filename
 
-                if found_id and primary_name:
-                    # Update name/ID with what we found
-                    model_version_id = found_id
-                    # Check if primary_name exists on disk (sanitize and confine to loras_dir)
-                    full_dest_path, safe_primary = cls._safe_path_in_dir(loras_dir, primary_name)
-                    if not full_dest_path:
-                        print("CivitaiLoraLoader: Unsafe destination path detected; aborting.")
-                        primary_name = None
-                    else:
-                        primary_name = safe_primary
-
-                    if primary_name:
-                        if os.path.exists(full_dest_path):
-                            filename = primary_name
-                            print(f"CivitaiLoraLoader: Found LoRA '{primary_name}'")
-                        elif auto_download:
-                            # Download to sanitized primary_name
-                            if cls.download_lora(model_version_id, primary_name, loras_dir, valid_api_key):
-                                filename = primary_name
-                            else:
-                                print(f"CivitaiLoraLoader: Download failed for '{primary_name}'")
-                        else:
-                            print(f"CivitaiLoraLoader: Auto-download disabled. Missing '{primary_name}'.")
-                else:
-                    print(f"CivitaiLoraLoader: Could not resolve info for '{name}'")
-
-            # Step 3: Load if we have a filename
             if filename:
                 print(f"CivitaiLoraLoader: Loading LoRA '{filename}' (strength={weight})")
                 try:
@@ -286,22 +313,30 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
 
     @staticmethod
     def download_lora(version_id, filename, loras_dir, api_key=None):
+        version_id = digits_only(version_id)
+        if not version_id:
+            print("CivitaiLoraLoader: Invalid model version id; aborting download.")
+            return False
+
         url = f"https://civitai.com/api/download/models/{version_id}"
-        if api_key and api_key.strip():
-            url += f"?token={api_key.strip()}"
+        if api_key and str(api_key).strip():
+            url += f"?token={str(api_key).strip()}"
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {"User-Agent": "Mozilla/5.0"}
         output_path, safe_name = CivitaiLoraLoader._safe_path_in_dir(loras_dir, filename)
         if not output_path:
             print("CivitaiLoraLoader: Unsafe destination path detected; aborting download.")
             return False
 
         part_path = f"{output_path}.part"
-        remote_size = CivitaiLoraLoader._probe_remote_size(url, headers, ctx)
+        try:
+            remote_size = CivitaiLoraLoader._probe_remote_size(url, headers)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            remote_size = None
+
+        if remote_size and remote_size > MAX_LORA_BYTES:
+            print(f"CivitaiLoraLoader: Remote file is too large to download ({remote_size} bytes).")
+            return False
 
         if os.path.exists(output_path):
             final_size = os.path.getsize(output_path)
@@ -321,8 +356,8 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                 if resume_from > 0:
                     req_headers["Range"] = f"bytes={resume_from}-"
 
-                req = urllib.request.Request(url, headers=req_headers)
-                with urllib.request.urlopen(req, context=ctx) as response:
+                req = urllib.request.Request(url, headers=req_headers)  # noqa: S310
+                with safe_urlopen(req, timeout=DOWNLOAD_TIMEOUT_S) as response:
                     if response.status not in (200, 206):
                         raise RuntimeError(f"Download failed with status {response.status}")
 
@@ -335,19 +370,33 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                     if response.status == 206 and content_length and expected_total is None:
                         try:
                             expected_total = resume_from + int(content_length)
-                        except Exception:
+                        except ValueError:
                             expected_total = None
+
+                    if expected_total and expected_total > MAX_LORA_BYTES:
+                        raise RuntimeError("Remote file exceeds the download size limit")
 
                     mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
                     initial = resume_from if mode == "ab" else 0
-                    with open(part_path, mode) as f:
-                        with tqdm(total=expected_total, initial=initial, unit='iB', unit_scale=True, desc=f"Downloading {safe_name}", leave=True) as pbar:
-                            while True:
-                                chunk = response.read(chunk_size)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                pbar.update(len(chunk))
+                    with (
+                        open(part_path, mode) as f,
+                        tqdm(
+                            total=expected_total,
+                            initial=initial,
+                            unit="iB",
+                            unit_scale=True,
+                            desc=f"Downloading {safe_name}",
+                            leave=True,
+                        ) as pbar,
+                    ):
+                        while True:
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            pbar.update(len(chunk))
+                            if pbar.n > MAX_LORA_BYTES:
+                                raise RuntimeError("Download exceeded the size limit")
 
                 current_size = os.path.getsize(part_path)
                 verified_total = remote_size or expected_total
@@ -362,15 +411,23 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
                 print(f"CivitaiLoraLoader: Download complete: {safe_name}")
                 return True
             except urllib.error.HTTPError as e:
-                if e.code == 404:
+                if e.code == 416 and os.path.exists(part_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(part_path)
+                    print("CivitaiLoraLoader: Resume range was rejected; restarting download.")
+                elif e.code == 404:
                     print("CivitaiLoraLoader: LoRA not found (404).")
                     return False
-                if e.code == 401:
+                elif e.code == 401:
                     print("CivitaiLoraLoader: Unauthorized (401). Check your API Key.")
                     return False
-                print(f"CivitaiLoraLoader: HTTP Error {e.code}: {e.reason}")
+                else:
+                    print(f"CivitaiLoraLoader: HTTP Error {e.code}: {e.reason}")
             except Exception as e:
-                print(f"CivitaiLoraLoader: Download attempt {attempt}/{max_retries} failed: {e}")
+                print(
+                    f"CivitaiLoraLoader: Download attempt {attempt}/{max_retries} failed: "
+                    f"{redact_secrets(e)}"
+                )
 
             if attempt < max_retries:
                 time.sleep(min(2 ** (attempt - 1), 8))
@@ -378,9 +435,11 @@ class CivitaiLoraLoader(comfy_io.ComfyNode):
         print(f"CivitaiLoraLoader: Failed to download {safe_name} after {max_retries} attempts.")
         return False
 
+
 class CivitaiLoraLoaderExtension(ComfyExtension):
     async def get_node_list(self) -> list[type[comfy_io.ComfyNode]]:
         return [CivitaiLoraLoader]
+
 
 async def comfy_entrypoint() -> ComfyExtension:
     return CivitaiLoraLoaderExtension()
