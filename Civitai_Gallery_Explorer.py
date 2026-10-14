@@ -1,99 +1,139 @@
-# ----- SECTION: Imports -----
+from __future__ import annotations
+
+import asyncio
 import io
 import json
 import os
+import threading
 import time
+import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 import aiohttp
 import numpy as np
 import torch
 from aiohttp import web
+from comfy_api.latest import ComfyExtension
+from comfy_api.latest import io as comfy_io
 from PIL import Image
 from server import PromptServer
 from typing_extensions import override
 
-from comfy_api.latest import ComfyExtension, io as comfy_io
+from _safety import (
+    MAX_IMAGE_BYTES,
+    MAX_VIDEO_BYTES,
+    clip_text,
+    content_disposition,
+    digits_only,
+    is_safe_public_url,
+    redact_secrets,
+    safe_urlopen,
+)
 
-
-# ----- SECTION: Constants -----
 NODE_DIR = os.path.dirname(os.path.abspath(__file__))
 FAVORITES_FILE = os.path.join(NODE_DIR, "civitai_favorites.json")
+_FAV_LOCK = threading.Lock()
+_AIO_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10, sock_read=30)
+_STREAM_DEADLINE_S = 45.0
+_MAX_FAVORITE_BYTES = 2_000_000
+_MAX_UPSTREAM_TEXT = 8_000_000
+_VIDEO_PROBE_BYTES = 4 * 1024 * 1024
 
 
-# ----- SECTION: Favorites Storage -----
-def load_favorites() -> Dict[str, Any]:
+def _read_favorites_unlocked() -> dict[str, Any]:
     if not os.path.exists(FAVORITES_FILE):
         return {}
     try:
-        with open(FAVORITES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(FAVORITES_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
         return {}
 
 
-def save_favorites(data: Dict[str, Any]) -> None:
+def _write_favorites_unlocked(data: dict[str, Any]) -> None:
+    tmp = FAVORITES_FILE + ".tmp"
     try:
-        tmp = FAVORITES_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, FAVORITES_FILE)
-    except Exception as e:
-        print(f"CivitaiGalleryExplorer: Error saving favorites: {e}")
+    except OSError as exc:
+        print(f"CivitaiGalleryExplorer: Error saving favorites: {exc}")
+        with suppress(OSError):
+            os.remove(tmp)
 
 
-# ----- SECTION: Utils -----
-def clamp_int(v: Any, lo: int, hi: int, default: int) -> int:
+def load_favorites() -> dict[str, Any]:
+    with _FAV_LOCK:
+        return _read_favorites_unlocked()
+
+
+def save_favorites(data: dict[str, Any]) -> None:
+    with _FAV_LOCK:
+        _write_favorites_unlocked(data)
+
+
+def update_favorites(mutator: Callable[[dict[str, Any]], tuple[Any, bool]]) -> Any:
+    with _FAV_LOCK:
+        data = _read_favorites_unlocked()
+        result, dirty = mutator(data)
+        if dirty:
+            _write_favorites_unlocked(data)
+        return result
+
+
+def clamp_int(value: Any, lo: int, hi: int, default: int) -> int:
     try:
-        n = int(str(v))
-    except Exception:
+        number = int(str(value))
+    except (TypeError, ValueError):
         return default
-    return max(lo, min(hi, n))
+    return max(lo, min(hi, number))
 
 
-def truthy(v: Any) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+def truthy(value: Any) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
-def item_is_video(it: Dict[str, Any]) -> bool:
-    u = str(it.get("url") or "").lower()
-    if u.endswith(".mp4") or u.endswith(".webm"):
+def item_is_video(item: dict[str, Any]) -> bool:
+    url = str(item.get("url") or "").lower()
+    if url.endswith((".mp4", ".webm")):
         return True
-    m = it.get("meta") or {}
-    mv = str(m.get("video") or m.get("videoUrl") or m.get("mp4") or m.get("mp4Url") or "").lower()
-    return mv.endswith(".mp4") or mv.endswith(".webm")
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    video = str(meta.get("video") or meta.get("videoUrl") or meta.get("mp4") or meta.get("mp4Url") or "").lower()
+    return video.endswith((".mp4", ".webm"))
 
 
-def item_has_positive_prompt(it: Dict[str, Any]) -> bool:
-    m = it.get("meta") or {}
-    for k in ("prompt", "Prompt", "positive", "textPrompt"):
-        if str(m.get(k) or "").strip():
-            return True
-    return False
+def item_has_positive_prompt(item: dict[str, Any]) -> bool:
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    return any(str(meta.get(key) or "").strip() for key in ("prompt", "Prompt", "positive", "textPrompt"))
 
 
-def item_matches_query_local(it: Dict[str, Any], q: str) -> bool:
-    if not q:
+def item_matches_query_local(item: dict[str, Any], query: str) -> bool:
+    if not query:
         return True
-    q = q.lower().strip()
-    m = it.get("meta") or {}
+    query = query.lower().strip()
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    user = item.get("user") if isinstance(item.get("user"), dict) else {}
     buf = " | ".join(
-        str(x or "")
-        for x in [
-            it.get("id"),
-            it.get("url"),
-            m.get("prompt"),
-            m.get("Prompt"),
-            m.get("textPrompt"),
-            m.get("negativePrompt"),
-            m.get("NegativePrompt"),
-            (it.get("user") or {}).get("username") or (it.get("user") or {}).get("name") or "",
-            m.get("Model") or m.get("model") or "",
+        str(part or "")
+        for part in [
+            item.get("id"),
+            item.get("url"),
+            meta.get("prompt"),
+            meta.get("Prompt"),
+            meta.get("textPrompt"),
+            meta.get("negativePrompt"),
+            meta.get("NegativePrompt"),
+            user.get("username") or user.get("name") or "",
+            meta.get("Model") or meta.get("model") or "",
         ]
     ).lower()
-    return q in buf
+    return query in buf
 
 
 def _empty_image_tensor() -> torch.Tensor:
@@ -101,21 +141,47 @@ def _empty_image_tensor() -> torch.Tensor:
 
 
 def _download_image_to_tensor(url: str, timeout_s: int = 30) -> torch.Tensor:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        data = resp.read()
+    if not is_safe_public_url(url):
+        raise ValueError("Blocked non-public image URL")
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})  # noqa: S310
+    with safe_urlopen(req, timeout=timeout_s) as resp:
+        data = resp.read(MAX_IMAGE_BYTES + 1)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("Image exceeds size limit")
     img = Image.open(io.BytesIO(data))
     if getattr(img, "is_animated", False):
-        try:
+        with suppress(EOFError, ValueError):
             img.seek(0)
-        except Exception:
-            pass
     img = img.convert("RGB")
     arr = np.array(img).astype(np.float32) / 255.0
     return torch.from_numpy(arr)[None, ...]
 
 
-# ----- SECTION: Node (V3) -----
+def _favorite_item_ok(item: Any) -> str | None:
+    if not isinstance(item, dict) or "id" not in item:
+        return None
+    try:
+        encoded = json.dumps(item)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > _MAX_FAVORITE_BYTES:
+        return None
+    return str(item["id"])[:128]
+
+
+def _clean_tags(tags: Any) -> list[str]:
+    if not isinstance(tags, list):
+        return []
+    cleaned: list[str] = []
+    for tag in tags[:50]:
+        if not isinstance(tag, str):
+            continue
+        text = tag.strip()
+        if text:
+            cleaned.append(text[:64])
+    return cleaned
+
+
 class CivitaiGalleryExplorerNode(comfy_io.ComfyNode):
     @classmethod
     def define_schema(cls) -> comfy_io.Schema:
@@ -124,7 +190,7 @@ class CivitaiGalleryExplorerNode(comfy_io.ComfyNode):
             display_name="🖼️ Civitai Gallery Explorer",
             category="💡fabwaseem/Civitai",
             inputs=[
-                comfy_io.String.Input(  
+                comfy_io.String.Input(
                     "selection_data",
                     default="{}",
                     multiline=False,
@@ -164,10 +230,13 @@ class CivitaiGalleryExplorerNode(comfy_io.ComfyNode):
 
     @classmethod
     def execute(cls, selection_data: str, positive_prompt: str, negative_prompt: str, lora_data: str):
-        try:
-            node_selection = json.loads(selection_data or "{}")
-        except Exception:
-            node_selection = {}
+        if not isinstance(selection_data, str) or len(selection_data) > 5_000_000:
+            node_selection: Any = {}
+        else:
+            try:
+                node_selection = json.loads(selection_data or "{}")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                node_selection = {}
 
         item_data = node_selection.get("item", {}) if isinstance(node_selection, dict) else {}
         should_download = bool(node_selection.get("download_image", False)) if isinstance(node_selection, dict) else False
@@ -176,55 +245,61 @@ class CivitaiGalleryExplorerNode(comfy_io.ComfyNode):
         if not isinstance(meta, dict):
             meta = {}
 
-        pos_prompt = str(positive_prompt or meta.get("prompt") or meta.get("Prompt") or meta.get("positive") or meta.get("textPrompt") or "")
-        neg_prompt = str(negative_prompt or meta.get("negativePrompt") or meta.get("NegativePrompt") or meta.get("negative") or "")
+        pos_prompt = str(
+            positive_prompt
+            or meta.get("prompt")
+            or meta.get("Prompt")
+            or meta.get("positive")
+            or meta.get("textPrompt")
+            or ""
+        )
+        neg_prompt = str(
+            negative_prompt or meta.get("negativePrompt") or meta.get("NegativePrompt") or meta.get("negative") or ""
+        )
 
         image_url = str(item_data.get("url") or "") if isinstance(item_data, dict) else ""
 
         info_dict = dict(meta)
-        for k in ("prompt", "Prompt", "positive", "textPrompt", "negativePrompt", "NegativePrompt", "negative"):
-            info_dict.pop(k, None)
+        for key in ("prompt", "Prompt", "positive", "textPrompt", "negativePrompt", "NegativePrompt", "negative"):
+            info_dict.pop(key, None)
 
         try:
             info_string = json.dumps(info_dict, indent=4, ensure_ascii=False)
-        except Exception:
+        except (TypeError, ValueError):
             info_string = "{}"
 
-        # Extract LoRA data
         resources = meta.get("resources") or []
         civitai_resources = meta.get("civitaiResources") or []
 
         lora_list = []
-        # From resources
         if isinstance(resources, list):
-            for r in resources:
-                # Updated check: case-insensitive check for "lora"
-                if isinstance(r, dict) and str(r.get("type", "")).lower() == "lora":
-                    # Skip if missing both modelVersionId and hash
-                    if r.get("modelVersionId") or r.get("hash"):
-                        lora_list.append(r)
+            for resource in resources:
+                if (
+                    isinstance(resource, dict)
+                    and str(resource.get("type", "")).lower() == "lora"
+                    and (resource.get("modelVersionId") or resource.get("hash"))
+                ):
+                    lora_list.append(resource)
 
-        # From civitaiResources
         if isinstance(civitai_resources, list):
-            for r in civitai_resources:
-                if isinstance(r, dict) and str(r.get("type", "")).lower() == "lora":
-                    # Skip if missing both modelVersionId and hash
-                    if r.get("modelVersionId") or r.get("hash"):
-                        lora_list.append(r)
+            for resource in civitai_resources:
+                if (
+                    isinstance(resource, dict)
+                    and str(resource.get("type", "")).lower() == "lora"
+                    and (resource.get("modelVersionId") or resource.get("hash"))
+                ):
+                    lora_list.append(resource)
 
         try:
-            # If user provided input, use it if valid JSON
-            if lora_data and lora_data.strip():
-                 try:
-                     # Validate it's JSON
-                     json.loads(lora_data)
-                     lora_string = lora_data
-                 except:
-                     # Fallback to extracted if input invalid
-                     lora_string = json.dumps(lora_list, indent=4, ensure_ascii=False)
+            if isinstance(lora_data, str) and lora_data.strip() and len(lora_data) <= 2_000_000:
+                try:
+                    json.loads(lora_data)
+                    lora_string = lora_data
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    lora_string = json.dumps(lora_list, indent=4, ensure_ascii=False)
             else:
                 lora_string = json.dumps(lora_list, indent=4, ensure_ascii=False)
-        except Exception:
+        except (TypeError, ValueError):
             lora_string = "[]"
 
         tensor = _empty_image_tensor()
@@ -238,13 +313,43 @@ class CivitaiGalleryExplorerNode(comfy_io.ComfyNode):
         return (pos_prompt, neg_prompt, tensor, info_string, lora_string)
 
 
-# ----- SECTION: Server Routes -----
 prompt_server = PromptServer.instance
+
+
+@asynccontextmanager
+async def _safe_get(session: aiohttp.ClientSession, url: str, **kwargs: Any):
+    current = url
+    response = None
+    for _ in range(5):
+        if not await asyncio.to_thread(is_safe_public_url, current):
+            raise aiohttp.ClientError("Blocked non-public URL")
+        response = await session.get(current, allow_redirects=False, **kwargs)
+        if response.status in {301, 302, 303, 307, 308}:
+            location = response.headers.get("Location")
+            response.release()
+            response = None
+            if not location:
+                raise aiohttp.ClientError("Redirect missing Location")
+            current = urllib.parse.urljoin(current, location)
+            continue
+        break
+    else:
+        raise aiohttp.ClientError("Too many redirects")
+    if response is None:
+        raise aiohttp.ClientError("No response")
+    try:
+        yield response
+    finally:
+        response.release()
+
+
+def _json_error(message: str, status: int = 500) -> web.Response:
+    return web.json_response({"status": "error", "message": redact_secrets(message)}, status=status)
 
 
 @prompt_server.routes.get("/civitai_gallery/get_all_favorites_data")
 async def get_all_favorites_data(request):
-    favorites = load_favorites()
+    favorites = await asyncio.to_thread(load_favorites)
     return web.json_response(favorites)
 
 
@@ -252,46 +357,46 @@ async def get_all_favorites_data(request):
 async def toggle_favorite(request):
     try:
         data = await request.json()
-        item = data.get("item")
-        if not isinstance(item, dict) or "id" not in item:
-            return web.json_response({"status": "error", "message": "Invalid item data"}, status=400)
+        item = data.get("item") if isinstance(data, dict) else None
+        item_id = _favorite_item_ok(item)
+        if item_id is None or not isinstance(item, dict):
+            return _json_error("Invalid item data", 400)
 
-        item_id = str(item["id"])
-        favorites = load_favorites()
-
-        if item_id in favorites:
-            del favorites[item_id]
-            status = "removed"
-        else:
+        def mutate(favorites: dict[str, Any]) -> tuple[str, bool]:
+            if item_id in favorites:
+                del favorites[item_id]
+                return "removed", True
             if item.get("meta") is None or not isinstance(item.get("meta"), dict):
                 item["meta"] = {}
             if "tags" not in item or not isinstance(item.get("tags"), list):
                 item["tags"] = []
             item["meta"].pop("prompt_saved", None)
             favorites[item_id] = item
-            status = "added"
+            return "added", True
 
-        save_favorites(favorites)
+        status = await asyncio.to_thread(update_favorites, mutate)
         return web.json_response({"status": status})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @prompt_server.routes.post("/civitai_gallery/add_or_update_favorite")
 async def add_or_update_favorite(request):
     try:
         data = await request.json()
-        item = data.get("item")
-        if not isinstance(item, dict) or "id" not in item:
-            return web.json_response({"status": "error", "message": "Invalid item data"}, status=400)
+        item = data.get("item") if isinstance(data, dict) else None
+        item_id = _favorite_item_ok(item)
+        if item_id is None or not isinstance(item, dict):
+            return _json_error("Invalid item data", 400)
 
-        item_id = str(item["id"])
-        favorites = load_favorites()
-        favorites[item_id] = item
-        save_favorites(favorites)
+        def mutate(favorites: dict[str, Any]) -> tuple[str, bool]:
+            favorites[item_id] = item
+            return "success", True
+
+        await asyncio.to_thread(update_favorites, mutate)
         return web.json_response({"status": "success"})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @prompt_server.routes.get("/civitai_gallery/get_favorites_images")
@@ -299,15 +404,12 @@ async def get_favorites_images(request):
     try:
         page = clamp_int(request.query.get("page", "1"), 1, 1_000_000, 1)
         limit = clamp_int(request.query.get("limit", "50"), 1, 200, 50)
-
-        favorites = load_favorites()
+        favorites = await asyncio.to_thread(load_favorites)
         items = list(favorites.values())
-
         total_items = len(items)
         start_index = (page - 1) * limit
         end_index = start_index + limit
         paginated_items = items[start_index:end_index]
-
         return web.json_response(
             {
                 "items": paginated_items,
@@ -319,111 +421,128 @@ async def get_favorites_images(request):
                 },
             }
         )
-    except Exception as e:
-        print(f"CivitaiGalleryExplorer: get_favorites_images error: {e}")
-        return web.json_response({"error": str(e)}, status=500)
+    except Exception as exc:
+        print(f"CivitaiGalleryExplorer: get_favorites_images error: {redact_secrets(exc)}")
+        return web.json_response({"error": redact_secrets(exc)}, status=500)
 
 
 @prompt_server.routes.post("/civitai_gallery/update_favorite_tags")
 async def update_favorite_tags(request):
     try:
         data = await request.json()
-        item_id = str(data.get("id") or "")
-        tags = data.get("tags", [])
+        if not isinstance(data, dict):
+            return _json_error("Invalid item data", 400)
+        item_id = str(data.get("id") or "")[:128]
+        tags = _clean_tags(data.get("tags", []))
         if not item_id:
-            return web.json_response({"status": "error", "message": "Missing item id"}, status=400)
-        if not isinstance(tags, list):
-            tags = []
+            return _json_error("Missing item id", 400)
 
-        favorites = load_favorites()
-        if item_id in favorites:
+        def mutate(favorites: dict[str, Any]) -> tuple[str, bool]:
+            if item_id not in favorites or not isinstance(favorites[item_id], dict):
+                return "missing", False
             favorites[item_id]["tags"] = tags
-            save_favorites(favorites)
-            return web.json_response({"status": "success"})
-        return web.json_response({"status": "error", "message": "Item not in favorites"}, status=404)
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+            return "success", True
+
+        status = await asyncio.to_thread(update_favorites, mutate)
+        if status == "missing":
+            return _json_error("Item not in favorites", 404)
+        return web.json_response({"status": "success"})
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @prompt_server.routes.get("/civitai_gallery/get_all_favorite_tags")
 async def get_all_favorite_tags(request):
     try:
-        favorites = load_favorites()
-        all_tags = set()
+        favorites = await asyncio.to_thread(load_favorites)
+        all_tags: set[str] = set()
         for item in favorites.values():
+            if not isinstance(item, dict):
+                continue
             tags = item.get("tags")
             if isinstance(tags, list):
-                for t in tags:
-                    if isinstance(t, str) and t.strip():
-                        all_tags.add(t.strip())
-        sorted_tags = sorted(list(all_tags), key=lambda s: s.lower())
-        return web.json_response({"tags": sorted_tags})
-    except Exception as e:
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+                for tag in tags:
+                    if isinstance(tag, str) and tag.strip():
+                        all_tags.add(tag.strip())
+        return web.json_response({"tags": sorted(all_tags, key=lambda tag: tag.lower())})
+    except Exception as exc:
+        return _json_error(str(exc), 500)
 
 
 @prompt_server.routes.get("/civitai_gallery/images_stream")
 async def get_civitai_images_stream(request):
     try:
-        nsfw = (request.query.get("nsfw", "None") or "").strip()
-        sort = (request.query.get("sort", "Most Reactions") or "").strip()
-        period = (request.query.get("period", "Day") or "").strip()
-        username = (request.query.get("username", "") or "").strip()
-        tags_q = (request.query.get("tags", "") or "").strip()
-        query_q = (request.query.get("query", "") or "").strip()
-        base_models_q = (request.query.get("baseModels", "") or "").strip()
+        nsfw = clip_text(request.query.get("nsfw", "None"), 32)
+        sort = clip_text(request.query.get("sort", "Most Reactions"), 64)
+        period = clip_text(request.query.get("period", "Day"), 32)
+        username = clip_text(request.query.get("username", ""), 100)
+        tags_q = clip_text(request.query.get("tags", ""), 200)
+        query_q = clip_text(request.query.get("query", ""), 200)
+        base_models_q = clip_text(request.query.get("baseModels", ""), 500)
 
         include_videos = truthy(request.query.get("include_videos", "false"))
         hide_no_prompt = truthy(request.query.get("hide_no_prompt", "false"))
         videos_only = truthy(request.query.get("videos_only", "false"))
 
         cursor = request.query.get("cursor", None)
+        if cursor is not None:
+            cursor = clip_text(cursor, 4000) or None
         min_batch = clamp_int(request.query.get("min_batch", "50"), 1, 500, 50)
 
         time_budget_ms = clamp_int(request.query.get("time_budget_ms", "0"), 0, 15000, 0)
         deadline = (time.monotonic() + (time_budget_ms / 1000.0)) if time_budget_ms > 0 else None
+        overall_deadline = time.monotonic() + _STREAM_DEADLINE_S
 
         international_version = truthy(request.query.get("international_version", "true"))
         base_domain = "civitai.com" if international_version else "civitai.work"
         base_url = f"https://{base_domain}/api/v1/images"
 
-        model_id = (request.query.get("modelId", "") or "").strip() or None
-        model_ver_id = (request.query.get("modelVersionId", "") or "").strip() or None
-
+        model_id = digits_only(request.query.get("modelId", ""))
+        model_ver_id = digits_only(request.query.get("modelVersionId", ""))
         upstream_limit = 200 if videos_only else 100
 
-        def build_params(cur: Optional[str]) -> Dict[str, str]:
-            p: Dict[str, str] = {
+        def build_params(cur: str | None) -> dict[str, str]:
+            params: dict[str, str] = {
                 "limit": str(upstream_limit),
                 "nsfw": nsfw,
                 "sort": sort,
                 "period": period,
             }
             if username:
-                p["username"] = username
+                params["username"] = username
             if tags_q:
-                p["tags"] = tags_q
+                params["tags"] = tags_q
             if query_q:
-                p["query"] = query_q
+                params["query"] = query_q
             if model_id:
-                p["modelId"] = model_id
+                params["modelId"] = model_id
             if model_ver_id:
-                p["modelVersionId"] = model_ver_id
+                params["modelVersionId"] = model_ver_id
             if base_models_q:
-                p["baseModels"] = base_models_q
+                params["baseModels"] = base_models_q
             if cur:
-                p["cursor"] = cur
-            return p
+                params["cursor"] = cur
+            return params
 
-        async def fetch_once(session: aiohttp.ClientSession, cur: Optional[str]) -> Dict[str, Any]:
+        async def fetch_once(session: aiohttp.ClientSession, cur: str | None) -> dict[str, Any]:
             params = build_params(cur)
-            async with session.get(base_url, params=params) as resp:
+            async with _safe_get(session, base_url, params=params) as resp:
                 text = await resp.text()
+                if len(text) > _MAX_UPSTREAM_TEXT:
+                    return {
+                        "items": [],
+                        "metadata": {"error": "upstream response too large"},
+                        "next": None,
+                    }
                 if resp.status != 200:
-                    return {"items": [], "metadata": {"error": f"upstream {resp.status}", "detail": text[:400]}, "next": None}
+                    return {
+                        "items": [],
+                        "metadata": {"error": f"upstream {resp.status}", "detail": text[:400]},
+                        "next": None,
+                    }
                 try:
                     data = json.loads(text)
-                except Exception:
+                except json.JSONDecodeError:
                     return {"items": [], "metadata": {"error": "bad json"}, "next": None}
 
                 md = data.get("metadata", {}) if isinstance(data, dict) else {}
@@ -434,39 +553,51 @@ async def get_civitai_images_stream(request):
                 return {"items": items, "metadata": md, "next": nxt}
 
         started = time.monotonic()
-        kept: List[Dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
         dropped = 0
         next_cursor = None
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=_AIO_TIMEOUT, trust_env=True) as session:
             cur = cursor
             for _ in range(50):
-                res = await fetch_once(session, cur)
+                if time.monotonic() >= overall_deadline:
+                    break
+                try:
+                    res = await fetch_once(session, cur)
+                except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+                    if kept:
+                        break
+                    return web.json_response(
+                        {"error": f"Upstream request failed: {redact_secrets(exc)}"},
+                        status=502,
+                    )
                 rec_items = res.get("items", [])
                 next_cursor = res.get("next", None)
+                upstream_error = res.get("metadata", {}).get("error") if isinstance(res.get("metadata"), dict) else None
+                if upstream_error and not kept and not rec_items:
+                    return web.json_response({"error": str(upstream_error)[:500]}, status=502)
 
-                for it in rec_items:
-                    if not isinstance(it, dict):
+                for item in rec_items:
+                    if not isinstance(item, dict):
                         dropped += 1
                         continue
 
                     if videos_only:
-                        if not item_is_video(it):
+                        if not item_is_video(item):
                             dropped += 1
                             continue
-                    else:
-                        if not include_videos and item_is_video(it):
-                            dropped += 1
-                            continue
-
-                    if hide_no_prompt and not item_has_positive_prompt(it):
-                        dropped += 1
-                        continue
-                    if query_q and not item_matches_query_local(it, query_q):
+                    elif not include_videos and item_is_video(item):
                         dropped += 1
                         continue
 
-                    kept.append(it)
+                    if hide_no_prompt and not item_has_positive_prompt(item):
+                        dropped += 1
+                        continue
+                    if query_q and not item_matches_query_local(item, query_q):
+                        dropped += 1
+                        continue
+
+                    kept.append(item)
 
                 if len(kept) >= min_batch:
                     break
@@ -495,29 +626,36 @@ async def get_civitai_images_stream(request):
             "timeBudgetMs": time_budget_ms,
         }
         return web.json_response({"items": served, "metadata": meta_out})
-    except Exception as e:
-        return web.json_response({"error": f"Unhandled: {e}"}, status=500)
+    except Exception as exc:
+        return web.json_response({"error": f"Unhandled: {redact_secrets(exc)}"}, status=500)
 
 
 @prompt_server.routes.post("/civitai_gallery/check_video_workflow")
 async def check_video_workflow(request):
-    data = await request.json()
-    video_url = data.get("url")
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"has_workflow": False, "error": "Invalid JSON"}, status=400)
+    video_url = data.get("url") if isinstance(data, dict) else None
     if not video_url:
         return web.json_response({"has_workflow": False, "error": "URL is missing"}, status=400)
+    if not await asyncio.to_thread(is_safe_public_url, str(video_url)):
+        return web.json_response({"has_workflow": False, "error": "URL is not allowed"}, status=400)
     try:
         headers = {"Range": "bytes=0-4194304"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video_url, headers=headers) as response:
-                if response.status >= 400 and response.status != 416:
-                    return web.json_response(
-                        {"has_workflow": False, "error": f"Failed to fetch video chunk, status: {response.status}"}
-                    )
-                chunk = await response.content.read()
-                has_workflow = b'"workflow":' in chunk or b'"prompt":' in chunk
-                return web.json_response({"has_workflow": has_workflow})
-    except Exception as e:
-        return web.json_response({"has_workflow": False, "error": str(e)}, status=500)
+        async with (
+            aiohttp.ClientSession(timeout=_AIO_TIMEOUT, trust_env=True) as session,
+            _safe_get(session, str(video_url), headers=headers) as response,
+        ):
+            if response.status >= 400 and response.status != 416:
+                return web.json_response(
+                    {"has_workflow": False, "error": f"Failed to fetch video chunk, status: {response.status}"}
+                )
+            chunk = await response.content.read(_VIDEO_PROBE_BYTES)
+            has_workflow = b'"workflow":' in chunk or b'"prompt":' in chunk
+            return web.json_response({"has_workflow": has_workflow})
+    except Exception as exc:
+        return web.json_response({"has_workflow": False, "error": redact_secrets(exc)}, status=500)
 
 
 @prompt_server.routes.get("/civitai_gallery/get_video_for_workflow")
@@ -525,23 +663,42 @@ async def get_video_for_workflow(request):
     video_url = request.query.get("url")
     if not video_url:
         return web.Response(status=400, text="Missing video URL")
+    if not await asyncio.to_thread(is_safe_public_url, video_url):
+        return web.Response(status=400, text="Video URL is not allowed")
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(video_url) as response:
-                if response.status != 200:
-                    return web.Response(status=response.status, text=f"Failed to fetch video from source: {response.reason}")
-                data = await response.read()
-                filename = video_url.split("/")[-1].split("?")[0] or "video_with_workflow.mp4"
+        timeout = aiohttp.ClientTimeout(total=120, connect=10, sock_read=30)
+        async with (
+            aiohttp.ClientSession(timeout=timeout, trust_env=True) as session,
+            _safe_get(session, video_url) as response,
+        ):
+            if response.status != 200:
                 return web.Response(
-                    body=data,
-                    content_type=response.content_type,
-                    headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+                    status=response.status,
+                    text=f"Failed to fetch video from source: {response.reason}",
                 )
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
+            if response.content_length and response.content_length > MAX_VIDEO_BYTES:
+                return web.Response(status=413, text="Video is too large")
+            filename = video_url.split("/")[-1].split("?")[0] or "video_with_workflow.mp4"
+            stream = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": response.content_type or "application/octet-stream",
+                    "Content-Disposition": content_disposition(filename),
+                },
+            )
+            await stream.prepare(request)
+            total = 0
+            async for chunk in response.content.iter_chunked(256 * 1024):
+                total += len(chunk)
+                if total > MAX_VIDEO_BYTES:
+                    break
+                await stream.write(chunk)
+            await stream.write_eof()
+            return stream
+    except Exception as exc:
+        return web.Response(status=500, text=redact_secrets(exc))
 
 
-# ----- SECTION: Entry Point (comfy_entrypoint) -----
 class CivitaiGalleryExplorerExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[comfy_io.ComfyNode]]:
