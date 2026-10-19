@@ -1,34 +1,30 @@
 import asyncio
-import importlib
 import json
 import sys
 import urllib.parse
-from pathlib import Path
 from types import SimpleNamespace
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PACKAGE_NAME = PACKAGE_ROOT.name
-gallery = importlib.import_module(f"{PACKAGE_NAME}.Civitai_Gallery_Explorer")
-lora_loader = importlib.import_module(f"{PACKAGE_NAME}.Civitai_Lora_Loader")
+import conftest
 
 
 def _load_package():
-    return importlib.import_module(PACKAGE_NAME)
+    """Load this custom node the way ComfyUI's ``load_custom_node`` does."""
+    return conftest.load_custom_node(conftest.PACKAGE_ROOT)
 
 
-def _assert_package_dir_not_on_sys_path():
-    for entry in sys.path:
-        raw = Path.cwd() if entry == "" else Path(entry)
-        try:
-            resolved = raw.resolve()
-        except OSError:
-            continue
-        assert resolved != PACKAGE_ROOT
+def _gallery():
+    return sys.modules[f"{conftest.PACKAGE_NAME}.Civitai_Gallery_Explorer"]
+
+
+def _lora_loader():
+    return sys.modules[f"{conftest.PACKAGE_NAME}.Civitai_Lora_Loader"]
 
 
 def test_package_imports_and_lists_both_nodes():
-    _assert_package_dir_not_on_sys_path()
+    conftest.assert_package_dir_not_on_sys_path()
     module = _load_package()
+    assert module.__name__ == conftest.PACKAGE_NAME
+    assert module.__name__ != "__init__"
     assert module.WEB_DIRECTORY == "./js"
     extension = asyncio.run(module.comfy_entrypoint())
     nodes = asyncio.run(extension.get_node_list())
@@ -39,27 +35,28 @@ def test_package_imports_and_lists_both_nodes():
 
 
 def test_package_init_import_registers_nodes():
-    """Import __init__ as a package, the way ComfyUI loads custom_nodes.
+    """Import the package ``__init__`` the way ComfyUI loads custom_nodes.
 
     Version 1.0.3 used bare sibling imports (``from _safety import ...``).
-    That raises ``No module named _safety`` once the package directory is not
-    on ``sys.path``, so this import registered no nodes.
+    With the package directory and cwd kept off ``sys.path``, that raises
+    ``No module named _safety`` and this import registers no nodes.
     """
-    _assert_package_dir_not_on_sys_path()
+    conftest.assert_package_dir_not_on_sys_path()
     module = _load_package()
-    assert Path(module.__file__).name == "__init__.py"
-    assert module.__package__ == PACKAGE_NAME
-    safety = sys.modules[f"{PACKAGE_NAME}._safety"]
-    assert safety.__package__ == PACKAGE_NAME
-    assert gallery.__package__ == PACKAGE_NAME
-    assert lora_loader.__package__ == PACKAGE_NAME
-
+    assert module.__file__.endswith("__init__.py")
+    assert module.__name__ == conftest.PACKAGE_NAME
+    assert module.__name__ != "__init__"
+    assert module.__package__ == conftest.PACKAGE_NAME
     extension = asyncio.run(module.comfy_entrypoint())
     nodes = asyncio.run(extension.get_node_list())
     assert sorted(node.__name__ for node in nodes) == [
         "CivitaiGalleryExplorerNode",
         "CivitaiLoraLoader",
     ]
+    safety = sys.modules[f"{conftest.PACKAGE_NAME}._safety"]
+    assert safety.__package__ == conftest.PACKAGE_NAME
+    assert _gallery().__package__ == conftest.PACKAGE_NAME
+    assert _lora_loader().__package__ == conftest.PACKAGE_NAME
 
 
 def test_execute_uses_widget_prompts_and_blocks_private_image():
@@ -72,7 +69,7 @@ def test_execute_uses_widget_prompts_and_blocks_private_image():
             "download_image": True,
         }
     )
-    positive, negative, tensor, _info, loras = gallery.CivitaiGalleryExplorerNode.execute(selection, "", "", "[]")
+    positive, negative, tensor, _info, loras = _gallery().CivitaiGalleryExplorerNode.execute(selection, "", "", "[]")
     assert positive == "from-meta"
     assert negative == "neg-meta"
     assert tensor[0] == "zeros"
@@ -80,7 +77,7 @@ def test_execute_uses_widget_prompts_and_blocks_private_image():
 
 
 def test_execute_keeps_explicit_prompts_and_invalid_selection():
-    positive, negative, _tensor, info, loras = gallery.CivitaiGalleryExplorerNode.execute(
+    positive, negative, _tensor, info, loras = _gallery().CivitaiGalleryExplorerNode.execute(
         "not-json",
         "keep-pos",
         "keep-neg",
@@ -93,9 +90,9 @@ def test_execute_keeps_explicit_prompts_and_invalid_selection():
 
 
 def test_favorites_round_trip(tmp_path, monkeypatch):
-    monkeypatch.setattr(gallery, "FAVORITES_FILE", str(tmp_path / "civitai_favorites.json"))
-    gallery.save_favorites({"9": {"id": 9, "url": "https://image.civitai.com/a.jpeg"}})
-    assert gallery.load_favorites()["9"]["id"] == 9
+    monkeypatch.setattr(_gallery(), "FAVORITES_FILE", str(tmp_path / "civitai_favorites.json"))
+    _gallery().save_favorites({"9": {"id": 9, "url": "https://image.civitai.com/a.jpeg"}})
+    assert _gallery().load_favorites()["9"]["id"] == 9
 
 
 def _request_url(url: str, params: dict | None) -> str:
@@ -148,13 +145,13 @@ def test_images_api_requests_include_with_meta(monkeypatch):
 
             return _await_response()
 
-    monkeypatch.setattr(gallery, "is_safe_public_url", lambda _url: True)
-    monkeypatch.setattr(gallery.aiohttp, "ClientSession", _Session)
+    monkeypatch.setattr(_gallery(), "is_safe_public_url", lambda _url: True)
+    monkeypatch.setattr(_gallery().aiohttp, "ClientSession", _Session)
 
     for international, host in (("true", "civitai.com"), ("false", "civitai.work")):
         captured.clear()
         request = SimpleNamespace(query={"international_version": international})
-        response = asyncio.run(gallery.get_civitai_images_stream(request))
+        response = asyncio.run(_gallery().get_civitai_images_stream(request))
         assert response.status == 200
         assert len(captured) >= 2
         for url in captured:

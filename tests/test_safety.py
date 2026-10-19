@@ -1,9 +1,10 @@
-import importlib
 import os
 import socket
-from pathlib import Path
+import sys
 
-_safety = importlib.import_module(f"{Path(__file__).resolve().parents[1].name}._safety")
+import conftest
+
+_safety = sys.modules[f"{conftest.NODE_PACKAGE.__name__}._safety"]
 clean_model_hash = _safety.clean_model_hash
 content_disposition = _safety.content_disposition
 digits_only = _safety.digits_only
