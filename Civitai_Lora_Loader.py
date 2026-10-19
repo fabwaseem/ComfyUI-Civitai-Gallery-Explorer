@@ -14,7 +14,7 @@ from comfy_api.latest import io as comfy_io
 from nodes import LoraLoader
 from tqdm import tqdm
 
-from _safety import (
+from ._safety import (
     API_TIMEOUT_S,
     DOWNLOAD_TIMEOUT_S,
     MAX_LORA_BYTES,
@@ -24,7 +24,7 @@ from _safety import (
     safe_join,
     safe_urlopen,
 )
-from _safety import (
+from ._safety import (
     safe_filename as _safe_filename,
 )
 

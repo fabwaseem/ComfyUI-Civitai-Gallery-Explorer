@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
+import importlib
 import os
-import sys
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -26,25 +25,17 @@ def _discover_py_files() -> list[str]:
     return files
 
 
-def _safe_mod_name(i: int, path: str) -> str:
-    base = os.path.splitext(os.path.basename(path))[0]
-    pkg = os.path.basename(os.path.dirname(__file__))
-    pkg = "".join(c if (c.isalnum() or c == "_") else "_" for c in pkg)
-    base = "".join(c if (c.isalnum() or c == "_") else "_" for c in base)
-    return f"_v3_{pkg}_{base}_{i}"
-
-
 def _load_modules(py_files: list[str]) -> list[Any]:
+    """Import sibling modules as package members so relative imports resolve.
+
+    ComfyUI loads this folder as a package and does not put the folder on
+    sys.path, so ``from _safety import ...`` cannot see ``_safety.py``.
+    """
     modules: list[Any] = []
-    for i, fpath in enumerate(py_files):
+    for fpath in py_files:
+        base = os.path.splitext(os.path.basename(fpath))[0]
         try:
-            mod_name = _safe_mod_name(i, fpath)
-            spec = importlib.util.spec_from_file_location(mod_name, fpath)
-            if spec is None or spec.loader is None:
-                continue
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[mod_name] = mod
-            spec.loader.exec_module(mod)
+            mod = importlib.import_module(f".{base}", __name__)
             modules.append(mod)
         except Exception as e:
             print(f"[custom_nodes] Import failed for {fpath}: {e}")

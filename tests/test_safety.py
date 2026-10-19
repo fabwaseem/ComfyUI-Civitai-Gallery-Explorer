@@ -1,15 +1,16 @@
+import importlib
 import os
 import socket
+from pathlib import Path
 
-from _safety import (
-    clean_model_hash,
-    content_disposition,
-    digits_only,
-    is_safe_public_url,
-    redact_secrets,
-    safe_filename,
-    safe_join,
-)
+_safety = importlib.import_module(f"{Path(__file__).resolve().parents[1].name}._safety")
+clean_model_hash = _safety.clean_model_hash
+content_disposition = _safety.content_disposition
+digits_only = _safety.digits_only
+is_safe_public_url = _safety.is_safe_public_url
+redact_secrets = _safety.redact_secrets
+safe_filename = _safety.safe_filename
+safe_join = _safety.safe_join
 
 
 def test_blocks_local_and_non_http_urls():

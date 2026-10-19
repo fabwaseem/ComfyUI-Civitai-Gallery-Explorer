@@ -1,14 +1,42 @@
-"""Install lightweight stand-ins so node modules import outside ComfyUI."""
+"""Install lightweight stand-ins so node modules import outside ComfyUI.
+
+ComfyUI imports a custom node by putting the parent of the node folder on
+``sys.path`` and importing that folder as a package. Tests do the same.
+Putting the package directory itself on ``sys.path`` would hide bare
+sibling imports such as ``from _safety import ...``.
+"""
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_PARENT = PACKAGE_ROOT.parent
+PACKAGE_NAME = PACKAGE_ROOT.name
+
+
+def _resolves_to(entry: str, target: Path) -> bool:
+    raw = os.getcwd() if entry == "" else entry
+    try:
+        return os.path.realpath(raw) == os.path.realpath(target)
+    except OSError:
+        return False
+
+
+def install_package_import_path() -> None:
+    sys.path[:] = [entry for entry in sys.path if not _resolves_to(entry, PACKAGE_ROOT)]
+    if not any(_resolves_to(entry, PACKAGE_PARENT) for entry in sys.path):
+        sys.path.insert(0, str(PACKAGE_PARENT))
+
+
+install_package_import_path()
+
+
+def pytest_configure(config):
+    install_package_import_path()
 
 
 def _module(name: str) -> types.ModuleType:

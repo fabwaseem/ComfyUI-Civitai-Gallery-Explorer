@@ -22,7 +22,7 @@ from PIL import Image
 from server import PromptServer
 from typing_extensions import override
 
-from _safety import (
+from ._safety import (
     MAX_IMAGE_BYTES,
     MAX_VIDEO_BYTES,
     clip_text,
@@ -507,6 +507,8 @@ async def get_civitai_images_stream(request):
                 "nsfw": nsfw,
                 "sort": sort,
                 "period": period,
+                # Civitai omits prompt/resource meta unless this opt-in is set.
+                "withMeta": "true",
             }
             if username:
                 params["username"] = username
